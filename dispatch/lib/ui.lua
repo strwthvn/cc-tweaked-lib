@@ -35,6 +35,8 @@ local function cmd_help()
     print("  status <id>             - detailed status")
     print("  cmd <id> <action>       - send command")
     print("  home [id|all]           - recall home")
+    print("  repos <id> <x> <y> <z> [N|E|S|W]")
+    print("                          - reset turtle position")
     print("  task <x1> <z1> <x2> <z2> <y> [sp] [bl]")
     print("                          - create mining task")
     print("  assign <task> [id|auto] [N|E|S|W]")
@@ -95,6 +97,36 @@ local function cmd_send(id, action, args_str)
 
     protocol.send(id, "command", { action = action, args = cmd_args })
     print("Command '" .. action .. "' sent to turtle #" .. id)
+end
+
+--- Reset turtle position (for lost turtles)
+local function cmd_repos(args_list)
+    if #args_list < 4 then
+        print("Usage: repos <id> <x> <y> <z> [N|E|S|W]")
+        return
+    end
+    local id = tonumber(args_list[1])
+    local x  = tonumber(args_list[2])
+    local y  = tonumber(args_list[3])
+    local z  = tonumber(args_list[4])
+    local dir_str_val = args_list[5]
+
+    if not (id and x and y and z) then
+        print("Error: ID and coordinates must be numbers")
+        return
+    end
+
+    local facing = nil
+    if dir_str_val then
+        local dir_map = { N = 2, S = 0, E = 3, W = 1 }
+        facing = dir_map[string.upper(dir_str_val)]
+    end
+
+    protocol.send(id, "command", {
+        action = "repos",
+        args = { x = x, y = y, z = z, facing = facing },
+    })
+    print("Position reset sent to turtle #" .. id .. ": " .. x .. "," .. y .. "," .. z)
 end
 
 --- Recall home
@@ -240,6 +272,10 @@ function ui.handle_input(line)
         local rest = ""
         for i = 4, #parts do rest = rest .. " " .. parts[i] end
         cmd_send(parts[2], parts[3], rest:sub(2))
+    elseif cmd == "repos" then
+        local repos_args = {}
+        for i = 2, #parts do repos_args[#repos_args + 1] = parts[i] end
+        cmd_repos(repos_args)
     elseif cmd == "home" then
         cmd_home(parts[2])
     elseif cmd == "task" then

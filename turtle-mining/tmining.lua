@@ -16,7 +16,7 @@ local base_pos     -- base coordinates (from dispatcher)
 local dispatch_id  -- dispatcher ID
 local current_task -- current task
 local tunnels      -- mined tunnels table { ["x,y,z"] = true }
-local status       -- "idle" | "mining" | "returning" | "paused" | "stopped"
+local status       -- "idle" | "mining" | "returning" | "paused" | "stopped" | "lost"
 local interrupt    -- nil | "stop" | "pause" | "go_home"
 local work_pos     -- work position (for return after base trip)
 
@@ -84,6 +84,14 @@ local function save_state()
     })
 end
 
+-- ========== Notify dispatcher ==========
+
+local function notify_dispatch(msg_type, payload)
+    if dispatch_id then
+        protocol.send(dispatch_id, msg_type, payload)
+    end
+end
+
 -- ========== Dispatcher registration ==========
 
 local function register_with_dispatch()
@@ -132,25 +140,45 @@ local function handle_message(sender_id, msg)
         elseif action == "resume" then
             interrupt = nil
             status = current_task and "mining" or "idle"
-        elseif action == "go_home" or action == "report" then
-            if action == "go_home" then
-                interrupt = "go_home"
-            end
+        elseif action == "go_home" then
+            interrupt = "go_home"
             protocol.send(sender_id, "ack", {
-                ref_type = "command",
-                ok = true,
-                msg = status,
+                ref_type = "command", ok = true, msg = status,
+            })
+        elseif action == "report" then
+            protocol.send(sender_id, "ack", {
+                ref_type = "command", ok = true, msg = status,
+            })
+        elseif action == "repos" and p.args then
+            -- Manual position reset (for lost turtles)
+            state.x = p.args.x
+            state.y = p.args.y
+            state.z = p.args.z
+            if p.args.facing then
+                state.facing = p.args.facing
+            end
+            status = "idle"
+            interrupt = nil
+            current_task = nil
+            save_state()
+            print("Position reset to: " .. position.to_string(state))
+            protocol.send(sender_id, "ack", {
+                ref_type = "command", ok = true,
+                msg = "repos ok: " .. position.to_string(state),
             })
         elseif action == "go_to" and p.args then
             interrupt = "stop"
             os.sleep(0.1)
-            nav.go_to(state, p.args.x, p.args.y, p.args.z)
+            local ok, err = nav.go_to(state, p.args.x, p.args.y, p.args.z)
             save_state()
             protocol.send(sender_id, "ack", {
                 ref_type = "command",
-                ok = true,
-                msg = "arrived",
+                ok = ok,
+                msg = ok and "arrived" or ("stuck: " .. tostring(err) .. " at " .. position.to_string(state)),
             })
+            if not ok then
+                status = "lost"
+            end
         end
 
     elseif t == "task_assign" then
@@ -178,7 +206,37 @@ local function return_to_base(reason)
     work_pos = position.copy(state)
 
     print("Returning to base: " .. reason)
-    nav.go_to(state, base_pos.x, base_pos.y, base_pos.z)
+
+    -- Use safe navigation (go up first, then horizontal, then down)
+    local ok, err = nav.go_to_safe(state, base_pos.x, base_pos.y, base_pos.z)
+
+    if not ok then
+        -- STUCK! Report to dispatcher and mark as lost
+        print("STUCK at " .. position.to_string(state) .. ": " .. tostring(err))
+        status = "lost"
+        notify_dispatch("status_report", {
+            status = "lost",
+            detail = "stuck going home: " .. tostring(err),
+            pos = state,
+        })
+        save_state()
+        return false
+    end
+
+    -- Verify we actually arrived
+    if not nav.arrived(state, base_pos.x, base_pos.y, base_pos.z) then
+        print("NAV ERROR: expected base but at " .. position.to_string(state))
+        status = "lost"
+        notify_dispatch("status_report", {
+            status = "lost",
+            detail = "position mismatch after nav",
+            pos = state,
+        })
+        save_state()
+        return false
+    end
+
+    print("Arrived at base")
 
     if reason == "inventory_full" then
         inventory.drop_all_forward()
@@ -188,7 +246,18 @@ local function return_to_base(reason)
     -- Return to work
     if old_status == "mining" and work_pos and interrupt ~= "go_home" and interrupt ~= "stop" then
         print("Returning to work...")
-        nav.go_to(state, work_pos.x, work_pos.y, work_pos.z)
+        local ok2, err2 = nav.go_to_safe(state, work_pos.x, work_pos.y, work_pos.z)
+        if not ok2 then
+            print("STUCK returning to work: " .. tostring(err2))
+            status = "lost"
+            notify_dispatch("status_report", {
+                status = "lost",
+                detail = "stuck returning to work: " .. tostring(err2),
+                pos = state,
+            })
+            save_state()
+            return false
+        end
         status = "mining"
     else
         status = "idle"
@@ -224,7 +293,10 @@ end
 
 local function loop_mining()
     while true do
-        if current_task and status == "mining" then
+        if status == "lost" then
+            -- Don't do anything when lost, wait for repos command
+            os.sleep(2)
+        elseif current_task and status == "mining" then
             local check_interrupt = function(s)
                 if base_pos and fuel.is_low(s, base_pos) then
                     return_to_base("fuel_low")
@@ -242,11 +314,9 @@ local function loop_mining()
             })
 
             if result == "done" then
-                if dispatch_id then
-                    protocol.send(dispatch_id, "task_done", {
-                        task_id = current_task.task_id,
-                    })
-                end
+                notify_dispatch("task_done", {
+                    task_id = current_task.task_id,
+                })
                 print("Task #" .. current_task.task_id .. " completed!")
                 current_task = nil
                 status = "idle"
@@ -260,9 +330,11 @@ local function loop_mining()
 
             elseif result == "recalled" then
                 return_to_base("recalled")
-                current_task = nil
-                status = "idle"
-                save_state()
+                if status ~= "lost" then
+                    current_task = nil
+                    status = "idle"
+                    save_state()
+                end
 
             elseif result == "stopped" then
                 status = "stopped"
