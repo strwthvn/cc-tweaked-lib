@@ -35,9 +35,7 @@ function position.to_string(state)
         position.DIR_TO_STR[state.facing] or "?")
 end
 
--- Movement wrappers: return true/false, update state
--- persist_fn is called after each successful movement
-
+-- persist callback
 local _persist_fn = nil
 
 function position.set_persist(fn)
@@ -48,9 +46,34 @@ local function _save()
     if _persist_fn then _persist_fn() end
 end
 
+-- Gravel-safe dig: keep digging until block stops falling
+function position.dig()
+    local dug = false
+    while turtle.detect() do
+        turtle.dig()
+        dug = true
+        os.sleep(0.4)
+    end
+    return dug
+end
+
+function position.digUp()
+    local dug = false
+    while turtle.detectUp() do
+        turtle.digUp()
+        dug = true
+        os.sleep(0.4)
+    end
+    return dug
+end
+
+function position.digDown()
+    return turtle.digDown()
+end
+
 --- Try to move forward with retry (digs blocks, waits for gravel/sand)
 function position.forward(state)
-    for attempt = 1, 5 do
+    for attempt = 1, 10 do
         local ok, err = turtle.forward()
         if ok then
             local d = FORWARD_DELTA[state.facing]
@@ -59,8 +82,17 @@ function position.forward(state)
             _save()
             return true
         end
-        turtle.dig()
-        os.sleep(0.4)
+        -- Dig falling blocks until clear, then retry
+        if turtle.detect() then
+            while turtle.detect() do
+                turtle.dig()
+                os.sleep(0.4)
+            end
+        else
+            -- Blocked by entity, try attacking
+            turtle.attack()
+            os.sleep(0.4)
+        end
     end
     return false, "blocked"
 end
@@ -78,21 +110,28 @@ function position.back(state)
 end
 
 function position.up(state)
-    for attempt = 1, 5 do
+    for attempt = 1, 10 do
         local ok, err = turtle.up()
         if ok then
             state.y = state.y + 1
             _save()
             return true
         end
-        turtle.digUp()
-        os.sleep(0.4)
+        if turtle.detectUp() then
+            while turtle.detectUp() do
+                turtle.digUp()
+                os.sleep(0.4)
+            end
+        else
+            turtle.attackUp()
+            os.sleep(0.4)
+        end
     end
     return false, "blocked"
 end
 
 function position.down(state)
-    for attempt = 1, 5 do
+    for attempt = 1, 10 do
         local ok, err = turtle.down()
         if ok then
             state.y = state.y - 1
@@ -117,19 +156,6 @@ function position.turnRight(state)
     state.facing = (state.facing + 1) % 4 -- clockwise
     _save()
     return true
-end
-
---- Dig forward (no movement)
-function position.dig()
-    return turtle.dig()
-end
-
-function position.digUp()
-    return turtle.digUp()
-end
-
-function position.digDown()
-    return turtle.digDown()
 end
 
 return position
