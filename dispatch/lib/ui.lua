@@ -236,6 +236,15 @@ local function cmd_assign(args_list)
     else
         local tid = tonumber(target)
         if tid then
+            local t = registry.get(tid)
+            if not t then
+                print("Error: turtle #" .. tid .. " not found")
+                return
+            end
+            if t.status == "offline" then
+                print("Error: turtle #" .. tid .. " is offline")
+                return
+            end
             turtle_ids = { tid }
         else
             print("Error: specify turtle ID or 'auto'")
