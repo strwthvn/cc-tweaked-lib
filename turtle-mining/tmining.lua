@@ -142,10 +142,17 @@ local function handle_message(sender_id, msg)
             interrupt = nil
             status = current_task and "mining" or "idle"
         elseif action == "go_home" then
-            interrupt = "go_home"
             protocol.send(sender_id, "ack", {
                 ref_type = "command", ok = true, msg = status,
             })
+            if status == "idle" or status == "stopped" or status == "paused" then
+                my_lane = 0
+                return_to_base("manual")
+                status = "idle"
+                save_state()
+            else
+                interrupt = "go_home"
+            end
         elseif action == "report" then
             protocol.send(sender_id, "ack", {
                 ref_type = "command", ok = true, msg = status,
@@ -201,7 +208,15 @@ local function handle_message(sender_id, msg)
     elseif t == "recall" then
         -- Direct recall with assigned lane (home all)
         my_lane = p.lane or 0
-        interrupt = "go_home"
+        if status == "idle" or status == "stopped" or status == "paused" then
+            -- Not mining, go home immediately
+            return_to_base("recalled")
+            status = "idle"
+            save_state()
+        else
+            -- Mining, set interrupt so mining loop handles it
+            interrupt = "go_home"
+        end
     end
 end
 
