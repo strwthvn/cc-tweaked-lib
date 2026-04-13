@@ -107,14 +107,14 @@ end
 
 function position.turnLeft(state)
     turtle.turnLeft()
-    state.facing = (state.facing + 1) % 4
+    state.facing = (state.facing - 1 + 4) % 4 -- counterclockwise
     _save()
     return true
 end
 
 function position.turnRight(state)
     turtle.turnRight()
-    state.facing = (state.facing - 1 + 4) % 4
+    state.facing = (state.facing + 1) % 4 -- clockwise
     _save()
     return true
 end
