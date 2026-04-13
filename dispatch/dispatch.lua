@@ -1,5 +1,5 @@
 -- dispatch.lua -- mining coordination dispatcher
--- Usage: dispatch
+-- Usage: dispatch <x> <y> <z>
 
 local registry = require("lib.registry")
 local tasks    = require("lib.tasks")
@@ -7,11 +7,27 @@ local mined    = require("lib.mined_areas")
 local protocol = require("lib.protocol")
 local ui       = require("lib.ui")
 
--- ========== Constants ==========
+-- ========== Parse arguments ==========
 
--- Base coordinates (chest for dropping resources)
--- CONFIGURE FOR YOUR WORLD:
-local BASE_POS = { x = 0, y = 64, z = 0 }
+local args = { ... }
+
+if #args < 3 then
+    print("Usage: dispatch <x> <y> <z>")
+    print("  x y z = base/chest coordinates")
+    print("Example: dispatch 100 64 -200")
+    return
+end
+
+local bx = tonumber(args[1])
+local by = tonumber(args[2])
+local bz = tonumber(args[3])
+
+if not (bx and by and bz) then
+    print("Error: coordinates must be numbers")
+    return
+end
+
+local BASE_POS = { x = bx, y = by, z = bz }
 
 -- ========== Return queue ==========
 
