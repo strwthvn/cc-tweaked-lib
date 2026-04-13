@@ -2,7 +2,7 @@
 
 local protocol = {}
 
-protocol.NAME = "mining_v1"
+protocol.NAME = "mining_v2"
 
 --- Build a message
 ---@param msg_type string
