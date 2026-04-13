@@ -142,17 +142,11 @@ local function handle_message(sender_id, msg)
             interrupt = nil
             status = current_task and "mining" or "idle"
         elseif action == "go_home" then
+            my_lane = 0
+            interrupt = "go_home"
             protocol.send(sender_id, "ack", {
                 ref_type = "command", ok = true, msg = status,
             })
-            if status == "idle" or status == "stopped" or status == "paused" then
-                my_lane = 0
-                return_to_base("manual")
-                status = "idle"
-                save_state()
-            else
-                interrupt = "go_home"
-            end
         elseif action == "report" then
             protocol.send(sender_id, "ack", {
                 ref_type = "command", ok = true, msg = status,
@@ -206,17 +200,9 @@ local function handle_message(sender_id, msg)
         print("Return granted, lane " .. my_lane)
 
     elseif t == "recall" then
-        -- Direct recall with assigned lane (home all)
+        -- Only set flags, loop_mining handles the actual movement
         my_lane = p.lane or 0
-        if status == "idle" or status == "stopped" or status == "paused" then
-            -- Not mining, go home immediately
-            return_to_base("recalled")
-            status = "idle"
-            save_state()
-        else
-            -- Mining, set interrupt so mining loop handles it
-            interrupt = "go_home"
-        end
+        interrupt = "go_home"
     end
 end
 
@@ -369,6 +355,17 @@ local function loop_mining()
     while true do
         if status == "lost" then
             os.sleep(2)
+
+        elseif interrupt == "go_home" then
+            -- Handle go_home in ANY state (idle, mining, paused, stopped)
+            interrupt = nil
+            return_to_base("recalled")
+            if status ~= "lost" then
+                current_task = nil
+                status = "idle"
+                save_state()
+            end
+
         elseif current_task and status == "mining" then
             local check_interrupt = function(s)
                 if base_pos and fuel.is_low(s, base_pos) then
