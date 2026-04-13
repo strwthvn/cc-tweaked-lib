@@ -146,4 +146,83 @@ function mining.execute_strip_mine(state, task_params, tunnels, callbacks)
     return "done"
 end
 
+--- Execute cuboid excavation (dig everything between two corners)
+--- params: { x1, y1, z1, x2, y2, z2 } (already normalized: x1<=x2, y1<=y2, z1<=z2)
+--- callbacks: { on_save, check_interrupt, base_pos }
+function mining.execute_cuboid(state, params, tunnels, callbacks)
+    local x1, y1, z1 = params.x1, params.y1, params.z1
+    local x2, y2, z2 = params.x2, params.y2, params.z2
+
+    -- Dig layer by layer, top to bottom
+    for y = y2, y1, -1 do
+        -- Navigate to start of this layer
+        -- Start corner depends on serpentine state to minimize travel
+        local start_x = x1
+        local z_forward = true -- true = z1->z2, false = z2->z1
+
+        for x = x1, x2 do
+            local layer_key = x .. "," .. y .. "," .. (z_forward and z1 or z2)
+
+            -- Check interrupts before each row
+            if callbacks.check_interrupt then
+                local action = callbacks.check_interrupt(state)
+                if action == "stop" then return "stopped" end
+                if action == "pause" then
+                    while true do
+                        os.sleep(1)
+                        local a = callbacks.check_interrupt(state)
+                        if a ~= "pause" then break end
+                    end
+                end
+                if action == "go_home" then return "recalled" end
+            end
+
+            if callbacks.base_pos then
+                if fuel.is_low(state, callbacks.base_pos) then
+                    return "fuel_low"
+                end
+                if inventory.is_full() then
+                    return "inventory_full"
+                end
+            end
+
+            -- Navigate to start of this row
+            local rz_start = z_forward and z1 or z2
+            local rz_end   = z_forward and z2 or z1
+            local rz_step  = z_forward and 1 or -1
+            local rz_face  = z_forward and 0 or 2 -- S or N
+
+            nav.go_to(state, x, y, rz_start)
+
+            -- Dig along Z
+            nav.turn_to(state, rz_face)
+            local row_len = math.abs(z2 - z1)
+            for step = 1, row_len do
+                position.dig()
+                position.digUp()
+                position.digDown()
+                if not position.forward(state) then break end
+                tunnels[state.x .. "," .. state.y .. "," .. state.z] = true
+            end
+            -- Dig at final position too
+            position.digUp()
+            position.digDown()
+            tunnels[state.x .. "," .. state.y .. "," .. state.z] = true
+
+            -- Shift to next X row (if not last)
+            if x < x2 then
+                nav.turn_to(state, 3) -- face East (+X)
+                position.dig()
+                position.forward(state)
+            end
+
+            z_forward = not z_forward
+
+            if callbacks.on_save then callbacks.on_save() end
+        end
+    end
+
+    return "done"
+end
+
 return mining

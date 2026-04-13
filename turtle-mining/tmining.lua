@@ -307,11 +307,17 @@ local function loop_mining()
                 return interrupt
             end
 
-            local result = mining.execute_strip_mine(state, current_task.params, tunnels, {
+            local result
+            local cb = {
                 on_save = save_state,
                 check_interrupt = check_interrupt,
                 base_pos = base_pos,
-            })
+            }
+            if current_task.type == "cuboid" then
+                result = mining.execute_cuboid(state, current_task.params, tunnels, cb)
+            else
+                result = mining.execute_strip_mine(state, current_task.params, tunnels, cb)
+            end
 
             if result == "done" then
                 notify_dispatch("task_done", {

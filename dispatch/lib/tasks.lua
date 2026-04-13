@@ -124,6 +124,92 @@ function tasks.split_for_turtles(task, turtle_ids, direction)
     return result
 end
 
+--- Create a cuboid excavation task (dig everything between two corners)
+---@param x1 number lower corner X
+---@param y1 number lower corner Y
+---@param z1 number lower corner Z
+---@param x2 number upper corner X
+---@param y2 number upper corner Y
+---@param z2 number upper corner Z
+---@return table task
+function tasks.create_cuboid(x1, y1, z1, x2, y2, z2)
+    local id = next_id
+    next_id = next_id + 1
+
+    local task = {
+        id = id,
+        type = "cuboid",
+        area = {
+            x1 = math.min(x1, x2),
+            y1 = math.min(y1, y2),
+            z1 = math.min(z1, z2),
+            x2 = math.max(x1, x2),
+            y2 = math.max(y1, y2),
+            z2 = math.max(z1, z2),
+        },
+        assigned = {},
+        status = "pending",
+        created_at = os.clock(),
+    }
+
+    task_list[id] = task
+    tasks.save()
+    return task
+end
+
+--- Split cuboid task for N turtles (vertical slices along longer horizontal axis)
+---@param task table
+---@param turtle_ids table
+---@return table[] assignments
+function tasks.split_cuboid_for_turtles(task, turtle_ids)
+    local n = #turtle_ids
+    if n == 0 then return {} end
+
+    local a = task.area
+    local dx = a.x2 - a.x1 + 1
+    local dz = a.z2 - a.z1 + 1
+
+    -- Split along longer horizontal axis
+    local split_axis = dx >= dz and "x" or "z"
+    local split_min, split_max
+    if split_axis == "x" then
+        split_min, split_max = a.x1, a.x2
+    else
+        split_min, split_max = a.z1, a.z2
+    end
+
+    local total = split_max - split_min + 1
+    local per_turtle = math.ceil(total / n)
+
+    local result = {}
+    for i, tid in ipairs(turtle_ids) do
+        local s_start = split_min + (i - 1) * per_turtle
+        local s_end   = math.min(s_start + per_turtle - 1, split_max)
+
+        if s_start > split_max then break end
+
+        local params
+        if split_axis == "x" then
+            params = {
+                x1 = s_start, y1 = a.y1, z1 = a.z1,
+                x2 = s_end,   y2 = a.y2, z2 = a.z2,
+            }
+        else
+            params = {
+                x1 = a.x1, y1 = a.y1, z1 = s_start,
+                x2 = a.x2, y2 = a.y2, z2 = s_end,
+            }
+        end
+
+        task.assigned[tid] = params
+        result[#result + 1] = { turtle_id = tid, params = params }
+    end
+
+    task.status = "active"
+    tasks.save()
+    return result
+end
+
 --- Get task
 function tasks.get(id)
     return task_list[id]

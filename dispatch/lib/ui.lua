@@ -38,7 +38,9 @@ local function cmd_help()
     print("  repos <id> <x> <y> <z> [N|E|S|W]")
     print("                          - reset turtle position")
     print("  task <x1> <z1> <x2> <z2> <y> [sp] [bl]")
-    print("                          - create mining task")
+    print("                          - create strip mine task")
+    print("  dig <x1> <y1> <z1> <x2> <y2> <z2>")
+    print("                          - create cuboid excavation")
     print("  assign <task> [id|auto] [N|E|S|W]")
     print("                          - assign task")
     print("  tasks                   - list tasks")
@@ -170,6 +172,34 @@ local function cmd_task(args_list)
     print("  Level Y: " .. y .. "  Spacing: " .. sp .. "  Branch len: " .. bl)
 end
 
+--- Create cuboid excavation task
+local function cmd_dig(args_list)
+    if #args_list < 6 then
+        print("Usage: dig <x1> <y1> <z1> <x2> <y2> <z2>")
+        print("  corner1: lower corner, corner2: upper diagonal")
+        return
+    end
+    local x1 = tonumber(args_list[1])
+    local y1 = tonumber(args_list[2])
+    local z1 = tonumber(args_list[3])
+    local x2 = tonumber(args_list[4])
+    local y2 = tonumber(args_list[5])
+    local z2 = tonumber(args_list[6])
+
+    if not (x1 and y1 and z1 and x2 and y2 and z2) then
+        print("Error: all coordinates must be numbers")
+        return
+    end
+
+    local task = tasks.create_cuboid(x1, y1, z1, x2, y2, z2)
+    local a = task.area
+    local vol = (a.x2 - a.x1 + 1) * (a.y2 - a.y1 + 1) * (a.z2 - a.z1 + 1)
+    print("Task #" .. task.id .. " created (cuboid)")
+    print("  From: " .. a.x1 .. "," .. a.y1 .. "," .. a.z1)
+    print("  To:   " .. a.x2 .. "," .. a.y2 .. "," .. a.z2)
+    print("  Volume: " .. vol .. " blocks")
+end
+
 --- Assign task to turtles
 local function cmd_assign(args_list)
     if #args_list < 1 then
@@ -213,7 +243,12 @@ local function cmd_assign(args_list)
         end
     end
 
-    local assignments = tasks.split_for_turtles(task, turtle_ids, direction)
+    local assignments
+    if task.type == "cuboid" then
+        assignments = tasks.split_cuboid_for_turtles(task, turtle_ids)
+    else
+        assignments = tasks.split_for_turtles(task, turtle_ids, direction)
+    end
 
     for _, a in ipairs(assignments) do
         protocol.send(a.turtle_id, "task_assign", {
@@ -225,7 +260,8 @@ local function cmd_assign(args_list)
         print("  Turtle #" .. a.turtle_id .. " assigned")
     end
 
-    print("Task #" .. task_id .. " assigned to " .. #assignments .. " turtles, direction " .. direction)
+    print("Task #" .. task_id .. " assigned to " .. #assignments .. " turtles"
+        .. (task.type ~= "cuboid" and (", direction " .. direction) or ""))
 end
 
 --- List tasks
@@ -236,10 +272,18 @@ local function cmd_tasks()
         count = count + 1
         local assigned_count = 0
         for _ in pairs(t.assigned) do assigned_count = assigned_count + 1 end
-        print(string.format("  #%d [%s] %s zone:%d,%d->%d,%d y:%d turtles:%d",
-            id, t.status, t.type,
-            t.area.x1, t.area.z1, t.area.x2, t.area.z2,
-            t.area.y, assigned_count))
+        if t.type == "cuboid" then
+            print(string.format("  #%d [%s] %s %d,%d,%d->%d,%d,%d turtles:%d",
+                id, t.status, t.type,
+                t.area.x1, t.area.y1, t.area.z1,
+                t.area.x2, t.area.y2, t.area.z2,
+                assigned_count))
+        else
+            print(string.format("  #%d [%s] %s zone:%d,%d->%d,%d y:%d turtles:%d",
+                id, t.status, t.type,
+                t.area.x1, t.area.z1, t.area.x2, t.area.z2,
+                t.area.y, assigned_count))
+        end
     end
     if count == 0 then
         print("  No tasks")
@@ -282,6 +326,10 @@ function ui.handle_input(line)
         local task_args = {}
         for i = 2, #parts do task_args[#task_args + 1] = parts[i] end
         cmd_task(task_args)
+    elseif cmd == "dig" then
+        local dig_args = {}
+        for i = 2, #parts do dig_args[#dig_args + 1] = parts[i] end
+        cmd_dig(dig_args)
     elseif cmd == "assign" then
         local assign_args = {}
         for i = 2, #parts do assign_args[#assign_args + 1] = parts[i] end
