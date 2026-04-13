@@ -62,15 +62,15 @@ function nav.go_to(state, tx, ty, tz)
     return true
 end
 
---- Safe navigation: go up to safe Y, travel horizontally, descend to target
---- Use this for long-distance travel (e.g. going home) to avoid lava/bedrock
-function nav.go_to_safe(state, tx, ty, tz)
-    local safe_y = math.max(nav.SAFE_Y, state.y, ty)
+--- Safe navigation with unique flight lane to avoid collisions
+--- lane: unique number per turtle (0, 1, 2, ...) for Y offset
+function nav.go_to_safe(state, tx, ty, tz, lane)
+    lane = lane or 0
+    local safe_y = math.max(nav.SAFE_Y + lane * 2, state.y, ty)
 
-    -- 1. Go up to safe height
+    -- 1. Go up to safe height (unique per turtle)
     while state.y < safe_y do
         if not position.up(state) then
-            -- Can't go higher, try traveling at current height
             break
         end
     end

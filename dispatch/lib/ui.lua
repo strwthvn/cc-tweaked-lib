@@ -8,9 +8,16 @@ local protocol = require("lib.protocol")
 local ui = {}
 
 local BASE_POS -- set externally
+local recall_all_fn = nil
+local recall_one_fn = nil
 
 function ui.set_base_pos(pos)
     BASE_POS = pos
+end
+
+function ui.set_recall_functions(all_fn, one_fn)
+    recall_all_fn = all_fn
+    recall_one_fn = one_fn
 end
 
 local function dir_str(facing)
@@ -134,13 +141,21 @@ end
 --- Recall home
 local function cmd_home(target)
     if target == "all" or not target then
-        protocol.broadcast("recall", { reason = "manual" })
-        print("Broadcast: all turtles returning home")
+        if recall_all_fn then
+            recall_all_fn()
+        else
+            protocol.broadcast("recall", { reason = "manual", lane = 0 })
+        end
+        print("All turtles returning home (unique lanes)")
     else
         local id = tonumber(target)
         if id then
-            protocol.send(id, "recall", { reason = "manual" })
-            print("Turtle #" .. id .. " returning home")
+            if recall_one_fn then
+                recall_one_fn(id)
+            else
+                protocol.send(id, "recall", { reason = "manual", lane = 0 })
+            end
+            print("Turtle #" .. id .. " queued for return")
         else
             print("Error: specify ID or 'all'")
         end

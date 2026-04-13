@@ -16,9 +16,11 @@ local base_pos     -- base coordinates (from dispatcher)
 local dispatch_id  -- dispatcher ID
 local current_task -- current task
 local tunnels      -- mined tunnels table { ["x,y,z"] = true }
-local status       -- "idle" | "mining" | "returning" | "paused" | "stopped" | "lost"
+local status       -- "idle" | "mining" | "returning" | "waiting_return" | "paused" | "stopped" | "lost"
 local interrupt    -- nil | "stop" | "pause" | "go_home"
 local work_pos     -- work position (for return after base trip)
+local my_lane      -- assigned flight lane for safe navigation
+local return_granted_flag = false -- set by network loop when return is granted
 
 -- ========== Argument parsing ==========
 
@@ -31,7 +33,6 @@ end
 
 local function init_from_args()
     if #args < 4 then
-        -- Try to restore from persist
         local saved = persist.load()
         if saved then
             state = saved.pos
@@ -150,7 +151,6 @@ local function handle_message(sender_id, msg)
                 ref_type = "command", ok = true, msg = status,
             })
         elseif action == "repos" and p.args then
-            -- Manual position reset (for lost turtles)
             state.x = p.args.x
             state.y = p.args.y
             state.z = p.args.z
@@ -192,9 +192,52 @@ local function handle_message(sender_id, msg)
             msg = "accepted",
         })
 
+    elseif t == "return_granted" then
+        -- Dispatcher granted us permission to return
+        my_lane = p.lane or 0
+        return_granted_flag = true
+        print("Return granted, lane " .. my_lane)
+
     elseif t == "recall" then
+        -- Direct recall with assigned lane (home all)
+        my_lane = p.lane or 0
         interrupt = "go_home"
     end
+end
+
+-- ========== Request return from dispatcher ==========
+
+--- Request permission to return to base. Waits for grant.
+--- Returns true + lane, or false if no dispatcher / timeout
+local function request_return(reason)
+    if not dispatch_id then
+        -- No dispatcher, return immediately on lane 0
+        return true, 0
+    end
+
+    -- Send request
+    return_granted_flag = false
+    notify_dispatch("request_return", {
+        reason = reason,
+        pos = state,
+    })
+
+    status = "waiting_return"
+    print("Waiting for return permission (" .. reason .. ")...")
+
+    -- Wait for grant (up to 60 seconds, keep listening)
+    for wait = 1, 60 do
+        -- Check if grant arrived (set by handle_message via loop_network)
+        if return_granted_flag then
+            return_granted_flag = false
+            return true, my_lane or 0
+        end
+        os.sleep(1)
+    end
+
+    -- Timeout: return anyway on fallback lane based on ID
+    print("Return permission timeout, going anyway")
+    return true, os.getComputerID() % 10
 end
 
 -- ========== Return to base ==========
@@ -202,16 +245,30 @@ end
 local function return_to_base(reason)
     if not base_pos then return false end
     local old_status = status
-    status = "returning"
     work_pos = position.copy(state)
 
-    print("Returning to base: " .. reason)
+    -- Request permission (queued return for inventory/fuel)
+    local granted, lane
+    if reason == "recalled" then
+        -- Already got lane from recall message
+        lane = my_lane or 0
+        granted = true
+    else
+        granted, lane = request_return(reason)
+    end
 
-    -- Use safe navigation (go up first, then horizontal, then down)
-    local ok, err = nav.go_to_safe(state, base_pos.x, base_pos.y, base_pos.z)
+    if not granted then
+        status = old_status
+        return false
+    end
+
+    status = "returning"
+    print("Returning to base: " .. reason .. " (lane " .. lane .. ")")
+
+    -- Use safe navigation with unique lane
+    local ok, err = nav.go_to_safe(state, base_pos.x, base_pos.y, base_pos.z, lane)
 
     if not ok then
-        -- STUCK! Report to dispatcher and mark as lost
         print("STUCK at " .. position.to_string(state) .. ": " .. tostring(err))
         status = "lost"
         notify_dispatch("status_report", {
@@ -223,7 +280,6 @@ local function return_to_base(reason)
         return false
     end
 
-    -- Verify we actually arrived
     if not nav.arrived(state, base_pos.x, base_pos.y, base_pos.z) then
         print("NAV ERROR: expected base but at " .. position.to_string(state))
         status = "lost"
@@ -243,10 +299,13 @@ local function return_to_base(reason)
     end
     fuel.try_refuel()
 
+    -- Notify dispatcher that return is complete
+    notify_dispatch("return_complete", {})
+
     -- Return to work
     if old_status == "mining" and work_pos and interrupt ~= "go_home" and interrupt ~= "stop" then
-        print("Returning to work...")
-        local ok2, err2 = nav.go_to_safe(state, work_pos.x, work_pos.y, work_pos.z)
+        print("Returning to work (lane " .. lane .. ")...")
+        local ok2, err2 = nav.go_to_safe(state, work_pos.x, work_pos.y, work_pos.z, lane)
         if not ok2 then
             print("STUCK returning to work: " .. tostring(err2))
             status = "lost"
@@ -294,7 +353,6 @@ end
 local function loop_mining()
     while true do
         if status == "lost" then
-            -- Don't do anything when lost, wait for repos command
             os.sleep(2)
         elseif current_task and status == "mining" then
             local check_interrupt = function(s)
