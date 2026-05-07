@@ -5,6 +5,7 @@
 local TANK_PATTERN = "^create:fluid_tank"
 local REFRESH      = 1
 local EMA_ALPHA    = 0.4
+local STATE_FILE   = ".diesel-storage.state"
 
 -- Capacity hints (used when tanks() does not return capacity).
 local DEFAULT_CAPACITY = 0
@@ -17,6 +18,28 @@ local CAPACITY_BY_NAME = {
 local prev = {}
 local rate = {}
 local prevTotal, rateTotal = nil, nil
+
+-- Auto-learned capacity: max amount ever seen per tank, persisted on disk.
+local maxSeen = {}
+local maxSeenDirty = false
+
+local function loadState()
+    if not fs.exists(STATE_FILE) then return end
+    local f = fs.open(STATE_FILE, "r")
+    if not f then return end
+    local data = f.readAll(); f.close()
+    local ok, st = pcall(textutils.unserialize, data)
+    if ok and type(st) == "table" then maxSeen = st end
+end
+
+local function saveState()
+    if not maxSeenDirty then return end
+    local f = fs.open(STATE_FILE, "w")
+    if not f then return end
+    f.write(textutils.serialize(maxSeen))
+    f.close()
+    maxSeenDirty = false
+end
 
 -- ===== data =====
 
@@ -44,11 +67,13 @@ local function readTank(name)
     return { fluids = fluids, total = total, capacity = capacity }
 end
 
+-- Returns capacity in mB, and a source tag: "real" | "manual" | "auto" | "none"
 local function effectiveCapacity(name, info)
-    if info.capacity and info.capacity > 0 then return info.capacity end
-    if CAPACITY_BY_NAME[name] then return CAPACITY_BY_NAME[name] end
-    if DEFAULT_CAPACITY > 0 then return DEFAULT_CAPACITY end
-    return 0
+    if info.capacity and info.capacity > 0 then return info.capacity, "real"   end
+    if CAPACITY_BY_NAME[name]              then return CAPACITY_BY_NAME[name], "manual" end
+    if DEFAULT_CAPACITY > 0                then return DEFAULT_CAPACITY, "manual" end
+    if maxSeen[name] and maxSeen[name] > 0 then return maxSeen[name], "auto"   end
+    return 0, "none"
 end
 
 -- ===== formatting =====
@@ -66,16 +91,25 @@ local function human(n)
     return string.format("%.2fG", n/1000000000)
 end
 
--- 6 chars wide
-local function humanRate(r)
-    if not r then return " --   " end
-    local abs  = math.abs(r)
-    local sign = r > 0.5 and "+" or (r < -0.5 and "-" or " ")
+-- Combined arrow + rate in 6 chars: "▼ 1.2k", "▲   12", "=    0", "  --  "
+local function trendRate(r)
+    if not r then return "  --  ", colors.gray end
+    local arrow, color
+    if     r >  0.5 then arrow, color = "\30", colors.lime
+    elseif r < -0.5 then arrow, color = "\31", colors.red
+    else                 arrow, color = "=",   colors.gray end
+
+    local abs = math.abs(r)
     local body
-    if abs < 1000        then body = string.format("%4d", math.floor(abs + 0.5))
-    elseif abs < 1000000 then body = string.format("%4.1fk", abs/1000)
-    else                      body = string.format("%4.2fM", abs/1000000) end
-    return string.format("%-6s", sign .. body)
+    if     abs < 1000    then body = string.format("%4d",   math.floor(abs + 0.5))
+    elseif abs < 1000000 then body = string.format("%3.1fk", abs/1000)
+    else                      body = string.format("%3.2fM", abs/1000000) end
+
+    -- pad/truncate to total 6 chars: arrow(1) + space(1) + body(4)
+    local out = arrow .. " " .. body
+    if #out < 6 then out = out .. string.rep(" ", 6 - #out)
+    elseif #out > 6 then out = out:sub(1, 6) end
+    return out, color
 end
 
 -- 5 chars wide
@@ -99,13 +133,6 @@ local function humanETA(amount, r)
 end
 
 -- ===== status colors =====
-
-local function trendArrow(r)
-    if not r          then return " ", colors.gray   end
-    if r >  0.5       then return "\30", colors.lime end  -- ▲
-    if r < -0.5       then return "\31", colors.red  end  -- ▼
-    return "=", colors.gray
-end
 
 local function etaColor(amount, r)
     if not r or r >= -0.5 or amount <= 0 then return colors.gray end
@@ -242,32 +269,30 @@ local function sectionBar(w, label)
 end
 
 -- Tank: 2 rows
--- Row 1:  "● 1 tank_0    diesel    ▼ -1.20k  ETA 21m"
--- Row 2:  "  [============         ] 72% 193.0k/256.0k"
+-- Row 1:  "● 1 tank_0     diesel  193.0k  ▼ 1.2k  21m"
+-- Row 2:  "   [████████░░░░░░░░░░░░░░░] ~72% / 256.0k"
 local function tankRows(idx, name, info, w)
     local r1, r2
 
-    local label = shortTank(name):sub(1, 8)
+    local label = shortTank(name):sub(1, 10)
     local id    = string.format("%d", idx)
 
     if info.error then
-        r1 = {
-            { colors.red,       "\7 " },          -- ●
+        return { {
+            { colors.red,       "\7 " },
             { colors.lightGray, id .. " " },
-            { colors.white,     string.format("%-9s", label) },
-            { colors.red,       " " .. info.error },
-        }
-        return { r1, {} }
+            { colors.white,     string.format("%-10s ", label) },
+            { colors.red,       info.error },
+        }, {} }
     end
 
     if #info.fluids == 0 then
-        r1 = {
+        return { {
             { colors.gray,      "\7 " },
             { colors.lightGray, id .. " " },
-            { colors.white,     string.format("%-9s", label) },
-            { colors.gray,      " (empty)" },
-        }
-        return { r1, {} }
+            { colors.white,     string.format("%-10s ", label) },
+            { colors.gray,      "(empty)" },
+        }, {} }
     end
 
     local main = info.fluids[1]
@@ -275,38 +300,40 @@ local function tankRows(idx, name, info, w)
         if f.amount > main.amount then main = f end
     end
 
-    local cap = effectiveCapacity(name, info)
+    local cap, capSrc = effectiveCapacity(name, info)
     local r   = rate[name]
-    local arrow, acolor = trendArrow(r)
-    local ec  = etaColor(info.total, r)
-    local dotColor = ec  -- статус-индикатор повторяет тревогу ETA
+    local trendStr, tcolor = trendRate(r)
+    local ec       = etaColor(info.total, r)
+    local dotColor = ec
 
-    -- Row 1: status, id, name, fluid, trend, rate, ETA
+    -- Row 1: ● id name  fluid  amount  ▼ rate  eta
     r1 = {
-        { dotColor,         "\7 " },                              -- ●
-        { colors.lightGray, id .. " " },
-        { colors.white,     string.format("%-9s ", label) },
-        { colors.lime,      string.format("%-7s", shortFluid(main.name):sub(1, 7)) },
-        { acolor,           " " .. arrow .. " " },
-        { acolor,           humanRate(r) },
-        { colors.lightGray, " ETA " },
-        { ec,               humanETA(info.total, r) },
+        { dotColor,         "\7 " },                                           -- 2
+        { colors.lightGray, id .. " " },                                       -- 2
+        { colors.white,     string.format("%-10s ", label) },                  -- 11
+        { colors.lime,      string.format("%-7s ", shortFluid(main.name):sub(1, 7)) }, -- 8
+        { colors.white,     string.format("%-7s ", human(info.total)) },       -- 8
+        { tcolor,           trendStr .. " " },                                 -- 7
+        { ec,               humanETA(info.total, r) },                         -- 5
     }
 
-    -- Row 2: indent + bar + pct + amount
+    -- Row 2: indent + bar + pct + capacity
     local pct
-    local amtStr
+    local pctMark = (capSrc == "auto") and "~" or " "
+    local pctStr, capStr
     if cap > 0 then
         pct = math.floor((info.total / cap) * 100 + 0.5)
-        amtStr = string.format(" %3d%% %s/%s", pct, human(info.total), human(cap))
+        pctStr = string.format("%s%3d%%", pctMark, pct)
+        capStr = " / " .. human(cap)
     else
-        amtStr = string.format("       %s", human(info.total))
+        pctStr = "  --%"
+        capStr = ""
     end
 
-    -- bar width fills the rest of the line
     local indent  = "   ["
-    local close   = "]"
-    local fixed   = #indent + #close + #amtStr
+    local close   = "] "
+    local tail    = pctStr .. capStr
+    local fixed   = #indent + #close + #tail
     local barW    = math.max(4, w - fixed)
     local fc      = cap > 0 and fillColor(pct) or colors.gray
 
@@ -314,14 +341,14 @@ local function tankRows(idx, name, info, w)
     for _, s in ipairs(barSegs(barW, info.total, cap, fc)) do
         r2[#r2 + 1] = s
     end
-    r2[#r2 + 1] = { colors.white, close }
-    r2[#r2 + 1] = { colors.white, amtStr }
+    r2[#r2 + 1] = { colors.white,     close }
+    r2[#r2 + 1] = { fc,               pctStr }
+    r2[#r2 + 1] = { colors.lightGray, capStr }
 
     return { r1, r2 }
 end
 
-local function totalRows(w, sums, grandTotal, grandCap, rateT)
-    -- sort by amount desc
+local function totalRows(w, sums, grandTotal, grandCap, rateT, anyAuto)
     local list = {}
     for f, a in pairs(sums) do list[#list + 1] = { f, a } end
     table.sort(list, function(a, b) return a[2] > b[2] end)
@@ -330,39 +357,42 @@ local function totalRows(w, sums, grandTotal, grandCap, rateT)
 
     for _, e in ipairs(list) do
         local fluid, amount = e[1], e[2]
-        local pct, amtStr
+        local pct, pctStr, capStr
+        local pctMark = anyAuto and "~" or " "
         if grandCap > 0 then
             pct = math.floor((amount / grandCap) * 100 + 0.5)
-            amtStr = string.format(" %3d%% %s/%s", pct, human(amount), human(grandCap))
+            pctStr = string.format("%s%3d%%", pctMark, pct)
+            capStr = " / " .. human(grandCap)
         else
-            amtStr = string.format("       %s", human(amount))
+            pctStr = "  --%"
+            capStr = ""
         end
-        local indent = "   ["
-        local close  = "]"
-        local fixed  = #indent + #close + #amtStr + 9  -- "diesel  " prefix below
+
+        local prefix = string.format(" %-7s [", shortFluid(fluid):sub(1, 7))
+        local close  = "] "
+        local tail   = pctStr .. capStr
+        local fixed  = #prefix + #close + #tail
         local barW   = math.max(4, w - fixed)
         local fc     = grandCap > 0 and fillColor(pct) or colors.cyan
 
-        local row = {
-            { colors.lime, string.format(" %-7s", shortFluid(fluid):sub(1, 7)) },
-            { colors.white, " [" },
-        }
+        local row = { { colors.lime, prefix } }
         for _, s in ipairs(barSegs(barW, amount, grandCap, fc)) do
             row[#row + 1] = s
         end
-        row[#row + 1] = { colors.white, close }
-        row[#row + 1] = { colors.white, amtStr }
+        row[#row + 1] = { colors.white,     close }
+        row[#row + 1] = { fc,               pctStr }
+        row[#row + 1] = { colors.lightGray, capStr }
         rows[#rows + 1] = row
     end
 
-    -- summary line: rate + ETA
-    local arrow, acolor = trendArrow(rateT)
+    -- summary: amount  trend  ETA
+    local trendStr, tcolor = trendRate(rateT)
     local ec = etaColor(grandTotal, rateT)
     rows[#rows + 1] = {
-        { colors.lightGray, " RATE: " },
-        { acolor,           arrow .. " " },
-        { acolor,           humanRate(rateT) },
-        { colors.lightGray, "    ETA " },
+        { colors.lightGray, " SYS " },
+        { colors.white,     string.format("%-8s ", human(grandTotal)) },
+        { tcolor,           trendStr .. " " },
+        { colors.lightGray, "ETA " },
         { ec,               humanETA(grandTotal, rateT) },
     }
 
@@ -385,15 +415,25 @@ local function build(tanks)
     end
 
     local sums, grandTotal, grandCap = {}, 0, 0
+    local anyAuto, anyManual, anyReal = false, false, false
     for i, name in ipairs(tanks) do
         local info = readTank(name)
         if not info.error then
             updateRate(name, info.total)
+            -- auto-learn capacity
+            if info.total > (maxSeen[name] or 0) then
+                maxSeen[name] = info.total
+                maxSeenDirty = true
+            end
             for _, f in ipairs(info.fluids) do
                 sums[f.name] = (sums[f.name] or 0) + f.amount
             end
             grandTotal = grandTotal + info.total
-            grandCap   = grandCap + effectiveCapacity(name, info)
+            local c, src = effectiveCapacity(name, info)
+            grandCap = grandCap + c
+            if     src == "auto"   then anyAuto   = true
+            elseif src == "manual" then anyManual = true
+            elseif src == "real"   then anyReal   = true end
         end
         for _, row in ipairs(tankRows(i, name, info, w)) do
             buf:add(row)
@@ -402,13 +442,19 @@ local function build(tanks)
 
     updateTotalRate(grandTotal)
 
-    for _, row in ipairs(totalRows(w, sums, grandTotal, grandCap, rateTotal)) do
+    for _, row in ipairs(totalRows(w, sums, grandTotal, grandCap, rateTotal, anyAuto)) do
         buf:add(row)
     end
 
-    -- footer hint
+    -- footer
     buf:add({ { colors.gray, string.rep("-", w) } })
-    buf:add({ { colors.lightGray, " q: quit  |  refresh " .. REFRESH .. "s" } })
+    local hint = " q:quit  ~%=auto-learned"
+    if anyAuto and not anyReal and not anyManual then
+        hint = " q:quit  ~%=auto-learned (fill tanks to calibrate)"
+    elseif not anyAuto then
+        hint = " q:quit  refresh " .. REFRESH .. "s"
+    end
+    buf:add({ { colors.lightGray, hint } })
 
     return buf
 end
@@ -416,7 +462,9 @@ end
 -- ===== main loop =====
 
 local function loop()
+    loadState()
     term.clear()
+    local lastSave = 0
     while true do
         local tanks = findTanks()
         local ok, bufOrErr = pcall(build, tanks)
@@ -428,12 +476,19 @@ local function loop()
             term.write("render error: " .. tostring(bufOrErr))
         end
 
+        -- persist auto-learned capacity at most once per ~30 s
+        if maxSeenDirty and (now() - lastSave) > 30 then
+            saveState()
+            lastSave = now()
+        end
+
         local timer = os.startTimer(REFRESH)
         while true do
             local ev, p1 = os.pullEvent()
             if ev == "timer" and p1 == timer then break end
             if ev == "peripheral" or ev == "peripheral_detach" then break end
             if ev == "key" and p1 == keys.q then
+                saveState()
                 if isColor() then
                     term.setBackgroundColor(colors.black)
                     term.setTextColor(colors.white)
@@ -442,7 +497,7 @@ local function loop()
                 term.setCursorPos(1, 1)
                 return
             end
-            if ev == "terminate" then return end
+            if ev == "terminate" then saveState(); return end
         end
     end
 end
