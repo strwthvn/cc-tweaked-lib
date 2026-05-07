@@ -1,23 +1,21 @@
--- Diesel Storage Monitor
+-- Diesel Storage Monitor (SCADA-style)
 -- Live readout of all Create fluid tanks attached via wired modems.
--- Compact, flicker-free, with per-tank and total flow rates (mB/s).
+-- 51x19 single-screen view, flicker-free, with rates and ETA.
 
 local TANK_PATTERN = "^create:fluid_tank"
-local REFRESH      = 1            -- seconds between updates
-local EMA_ALPHA    = 0.4          -- 0..1, higher = более чувствительно, ниже = плавнее
+local REFRESH      = 1
+local EMA_ALPHA    = 0.4
 
--- Если CC:T не возвращает capacity, пропиши вручную (mB) — будет показан %.
--- Можно общий через DEFAULT_CAPACITY, можно индивидуальный через CAPACITY_BY_NAME.
-local DEFAULT_CAPACITY  = 0       -- 0 = выключено
-local CAPACITY_BY_NAME  = {
+-- Capacity hints (used when tanks() does not return capacity).
+local DEFAULT_CAPACITY = 0
+local CAPACITY_BY_NAME = {
     -- ["create:fluid_tank_0"] = 256000,
-    -- ["create:fluid_tank_1"] = 256000,
 }
 
 -- ===== state =====
 
-local prev = {}        -- [tankName] = { amount=N, t=seconds }
-local rate = {}        -- [tankName] = mB/s (smoothed)
+local prev = {}
+local rate = {}
 local prevTotal, rateTotal = nil, nil
 
 -- ===== data =====
@@ -34,7 +32,6 @@ end
 local function readTank(name)
     local p = peripheral.wrap(name)
     if not p or not p.tanks then return { error = "no peripheral" } end
-
     local ok, data = pcall(p.tanks)
     if not ok then return { error = tostring(data) } end
 
@@ -61,18 +58,17 @@ local function shortTank(id)
     return (id:match("([^:_]+_%d+)$") or id:match(":(.+)$") or id)
 end
 
--- 12345 -> "12.3k", 1234567 -> "1.23M"
 local function human(n)
     n = n or 0
-    if n < 1000        then return tostring(n) end
+    if n < 1000        then return tostring(math.floor(n)) end
     if n < 1000000     then return string.format("%.1fk", n/1000) end
     if n < 1000000000  then return string.format("%.2fM", n/1000000) end
     return string.format("%.2fG", n/1000000000)
 end
 
--- "+12 mB/s", "-1.2k mB/s", "  0    mB/s"  (6 chars)
+-- 6 chars wide
 local function humanRate(r)
-    if not r then return "  --  " end
+    if not r then return " --   " end
     local abs  = math.abs(r)
     local sign = r > 0.5 and "+" or (r < -0.5 and "-" or " ")
     local body
@@ -82,12 +78,11 @@ local function humanRate(r)
     return string.format("%-6s", sign .. body)
 end
 
--- ETA до опустошения: округление до минут/часов/дней
--- amount mB, rate mB/s (отрицательный = расход)
-local function humanETA(amount, rate)
-    if not rate or rate >= -0.5 then return "  -- " end
+-- 5 chars wide
+local function humanETA(amount, r)
+    if not r or r >= -0.5 then return "  -- " end
     if amount <= 0 then return "  0m " end
-    local s = amount / -rate
+    local s = amount / -r
     if s < 60     then return " <1m " end
     if s < 3600   then return string.format("%4dm", math.floor(s/60 + 0.5)) end
     if s < 86400  then
@@ -103,16 +98,34 @@ local function humanETA(amount, rate)
     return string.format("%dd%02dh", d, h)
 end
 
-local function bar(used, cap, width)
-    if cap <= 0 then return string.rep(".", width) end
-    local f = math.floor((used / cap) * width + 0.5)
-    if f > width then f = width end
-    if f < 0     then f = 0     end
-    return string.rep("|", f) .. string.rep(".", width - f)
+-- ===== status colors =====
+
+local function trendArrow(r)
+    if not r          then return " ", colors.gray   end
+    if r >  0.5       then return "\30", colors.lime end  -- ▲
+    if r < -0.5       then return "\31", colors.red  end  -- ▼
+    return "=", colors.gray
+end
+
+local function etaColor(amount, r)
+    if not r or r >= -0.5 or amount <= 0 then return colors.gray end
+    local s = amount / -r
+    if s <  300 then return colors.red end
+    if s < 1800 then return colors.orange end
+    if s < 3600 then return colors.yellow end
+    return colors.lime
+end
+
+local function fillColor(pct)
+    if pct < 10 then return colors.red end
+    if pct < 30 then return colors.orange end
+    if pct < 60 then return colors.yellow end
+    return colors.lime
 end
 
 -- ===== render buffer =====
 
+-- Each segment: { fg, text [, bg] }
 local Buf = {}
 Buf.__index = Buf
 
@@ -133,15 +146,25 @@ function Buf:flush()
         for _, s in ipairs(segs) do
             local txt = s[2] or ""
             if used + #txt > self.w then txt = txt:sub(1, self.w - used) end
-            if isColor() then term.setTextColor(s[1]) end
+            if isColor() then
+                term.setTextColor(s[1] or colors.white)
+                term.setBackgroundColor(s[3] or colors.black)
+            end
             term.write(txt)
             used = used + #txt
             if used >= self.w then break end
         end
         if used < self.w then
-            if isColor() then term.setTextColor(colors.white) end
+            if isColor() then
+                term.setTextColor(colors.white)
+                term.setBackgroundColor(colors.black)
+            end
             term.write(string.rep(" ", self.w - used))
         end
+    end
+    if isColor() then
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
     end
 end
 
@@ -177,26 +200,74 @@ local function updateTotalRate(total)
     prevTotal = { amount = total, t = t }
 end
 
--- ===== layout =====
+-- ===== layout primitives =====
 
-local function tankLine(idx, name, info, w)
+-- Draw a horizontal bar as bg-painted spaces. Returns segments.
+-- width: total cells; cap: capacity; used: filled amount; fc: fill color
+local function barSegs(width, used, cap, fc)
+    if width < 1 then return {} end
+    if cap <= 0 then
+        return { { colors.gray, string.rep(" ", width), colors.gray } }
+    end
+    local f = math.floor((used / cap) * width + 0.5)
+    if f > width then f = width end
+    if f < 0     then f = 0     end
+    local segs = {}
+    if f > 0          then segs[#segs+1] = { colors.white, string.rep(" ", f),         fc           } end
+    if f < width      then segs[#segs+1] = { colors.white, string.rep(" ", width - f), colors.gray } end
+    return segs
+end
+
+-- ===== rows =====
+
+local function titleBar(w)
+    local title = " DIESEL STORAGE"
+    local clk   = textutils.formatTime(os.time(), true) .. " "
+    local mid   = string.rep(" ", math.max(1, w - #title - #clk))
+    return {
+        { colors.black, title, colors.yellow },
+        { colors.black, mid,   colors.yellow },
+        { colors.black, clk,   colors.yellow },
+    }
+end
+
+local function sectionBar(w, label)
+    -- "-- TOTAL ------------------------------"
+    local prefix = "- " .. label .. " "
+    local rest   = string.rep("-", math.max(1, w - #prefix))
+    return {
+        { colors.gray, prefix },
+        { colors.gray, rest },
+    }
+end
+
+-- Tank: 2 rows
+-- Row 1:  "● 1 tank_0    diesel    ▼ -1.20k  ETA 21m"
+-- Row 2:  "  [============         ] 72% 193.0k/256.0k"
+local function tankRows(idx, name, info, w)
+    local r1, r2
+
+    local label = shortTank(name):sub(1, 8)
     local id    = string.format("%d", idx)
-    local label = shortTank(name)
 
     if info.error then
-        return {
+        r1 = {
+            { colors.red,       "\7 " },          -- ●
             { colors.lightGray, id .. " " },
-            { colors.white,     string.format("%-12s ", label:sub(1, 12)) },
-            { colors.red,       "err: " .. info.error },
+            { colors.white,     string.format("%-9s", label) },
+            { colors.red,       " " .. info.error },
         }
+        return { r1, {} }
     end
 
     if #info.fluids == 0 then
-        return {
+        r1 = {
+            { colors.gray,      "\7 " },
             { colors.lightGray, id .. " " },
-            { colors.white,     string.format("%-12s ", label:sub(1, 12)) },
-            { colors.gray,      "(empty)" },
+            { colors.white,     string.format("%-9s", label) },
+            { colors.gray,      " (empty)" },
         }
+        return { r1, {} }
     end
 
     local main = info.fluids[1]
@@ -206,60 +277,110 @@ local function tankLine(idx, name, info, w)
 
     local cap = effectiveCapacity(name, info)
     local r   = rate[name]
+    local arrow, acolor = trendArrow(r)
+    local ec  = etaColor(info.total, r)
+    local dotColor = ec  -- статус-индикатор повторяет тревогу ETA
 
-    local segs = {
+    -- Row 1: status, id, name, fluid, trend, rate, ETA
+    r1 = {
+        { dotColor,         "\7 " },                              -- ●
         { colors.lightGray, id .. " " },
-        { colors.white,     string.format("%-12s ", label:sub(1, 12)) },
-        { colors.lime,      string.format("%-8s ",  shortFluid(main.name):sub(1, 8)) },
+        { colors.white,     string.format("%-9s ", label) },
+        { colors.lime,      string.format("%-7s", shortFluid(main.name):sub(1, 7)) },
+        { acolor,           " " .. arrow .. " " },
+        { acolor,           humanRate(r) },
+        { colors.lightGray, " ETA " },
+        { ec,               humanETA(info.total, r) },
     }
 
+    -- Row 2: indent + bar + pct + amount
+    local pct
+    local amtStr
     if cap > 0 then
-        local pct = math.floor((info.total / cap) * 100 + 0.5)
-        local fixed = #id + 1 + 13 + 9 + 5 + 1 + 1 + 11 + 1 + 9
-        local bw = math.max(4, math.min(12, w - fixed))
-        segs[#segs + 1] = { colors.yellow, string.format("%3d%% ", pct) }
-        segs[#segs + 1] = { colors.cyan,   "[" .. bar(info.total, cap, bw) .. "] " }
-        segs[#segs + 1] = { colors.white,  string.format("%9s ", human(info.total) .. "/" .. human(cap)) }
+        pct = math.floor((info.total / cap) * 100 + 0.5)
+        amtStr = string.format(" %3d%% %s/%s", pct, human(info.total), human(cap))
     else
-        segs[#segs + 1] = { colors.white,  string.format("%9s ", human(info.total)) }
+        amtStr = string.format("       %s", human(info.total))
     end
 
-    local rcolor = colors.gray
-    if r and r >  0.5 then rcolor = colors.lime end
-    if r and r < -0.5 then rcolor = colors.red  end
-    segs[#segs + 1] = { rcolor, humanRate(r) .. " " }
+    -- bar width fills the rest of the line
+    local indent  = "   ["
+    local close   = "]"
+    local fixed   = #indent + #close + #amtStr
+    local barW    = math.max(4, w - fixed)
+    local fc      = cap > 0 and fillColor(pct) or colors.gray
 
-    -- ETA: красный если опустошение скоро (< 5 мин), оранжевый < 30 мин, жёлтый иначе
-    local eta = humanETA(info.total, r)
-    local ecolor = colors.gray
-    if r and r < -0.5 and info.total > 0 then
-        local s = info.total / -r
-        if     s < 300  then ecolor = colors.red
-        elseif s < 1800 then ecolor = colors.orange
-        else                 ecolor = colors.yellow end
+    r2 = { { colors.white, indent } }
+    for _, s in ipairs(barSegs(barW, info.total, cap, fc)) do
+        r2[#r2 + 1] = s
     end
-    segs[#segs + 1] = { ecolor, eta }
+    r2[#r2 + 1] = { colors.white, close }
+    r2[#r2 + 1] = { colors.white, amtStr }
 
-    return segs
+    return { r1, r2 }
 end
+
+local function totalRows(w, sums, grandTotal, grandCap, rateT)
+    -- sort by amount desc
+    local list = {}
+    for f, a in pairs(sums) do list[#list + 1] = { f, a } end
+    table.sort(list, function(a, b) return a[2] > b[2] end)
+
+    local rows = { sectionBar(w, "TOTAL") }
+
+    for _, e in ipairs(list) do
+        local fluid, amount = e[1], e[2]
+        local pct, amtStr
+        if grandCap > 0 then
+            pct = math.floor((amount / grandCap) * 100 + 0.5)
+            amtStr = string.format(" %3d%% %s/%s", pct, human(amount), human(grandCap))
+        else
+            amtStr = string.format("       %s", human(amount))
+        end
+        local indent = "   ["
+        local close  = "]"
+        local fixed  = #indent + #close + #amtStr + 9  -- "diesel  " prefix below
+        local barW   = math.max(4, w - fixed)
+        local fc     = grandCap > 0 and fillColor(pct) or colors.cyan
+
+        local row = {
+            { colors.lime, string.format(" %-7s", shortFluid(fluid):sub(1, 7)) },
+            { colors.white, " [" },
+        }
+        for _, s in ipairs(barSegs(barW, amount, grandCap, fc)) do
+            row[#row + 1] = s
+        end
+        row[#row + 1] = { colors.white, close }
+        row[#row + 1] = { colors.white, amtStr }
+        rows[#rows + 1] = row
+    end
+
+    -- summary line: rate + ETA
+    local arrow, acolor = trendArrow(rateT)
+    local ec = etaColor(grandTotal, rateT)
+    rows[#rows + 1] = {
+        { colors.lightGray, " RATE: " },
+        { acolor,           arrow .. " " },
+        { acolor,           humanRate(rateT) },
+        { colors.lightGray, "    ETA " },
+        { ec,               humanETA(grandTotal, rateT) },
+    }
+
+    return rows
+end
+
+-- ===== build =====
 
 local function build(tanks)
     local w, h = term.getSize()
     local buf  = newBuf(w, h)
 
-    local title = "=== Diesel Storage ==="
-    local clk   = textutils.formatTime(os.time(), true)
-    local pad   = math.max(1, w - #title - #clk)
-    buf:add({
-        { colors.yellow,    title },
-        { colors.white,     string.rep(" ", pad) },
-        { colors.lightGray, clk },
-    })
+    buf:add(titleBar(w))
 
     if #tanks == 0 then
         buf:blank()
-        buf:add({ { colors.red, "No Create fluid tanks found." } })
-        buf:add({ { colors.lightGray, "Connect tanks via wired modem." } })
+        buf:add({ { colors.red, " No Create fluid tanks found." } })
+        buf:add({ { colors.lightGray, " Connect tanks via wired modem." } })
         return buf
     end
 
@@ -274,52 +395,20 @@ local function build(tanks)
             grandTotal = grandTotal + info.total
             grandCap   = grandCap + effectiveCapacity(name, info)
         end
-        buf:add(tankLine(i, name, info, w))
+        for _, row in ipairs(tankRows(i, name, info, w)) do
+            buf:add(row)
+        end
     end
 
     updateTotalRate(grandTotal)
 
-    buf:add({ { colors.gray, string.rep("-", w) } })
-
-    -- totals
-    local list = {}
-    for f, a in pairs(sums) do list[#list + 1] = { f, a } end
-    table.sort(list, function(a, b) return a[2] > b[2] end)
-
-    for _, e in ipairs(list) do
-        local fluid, amount = e[1], e[2]
-        local segs = {
-            { colors.yellow, "TOTAL " },
-            { colors.lime,   string.format("%-8s ", shortFluid(fluid):sub(1, 8)) },
-        }
-        if grandCap > 0 then
-            local pct = math.floor((amount / grandCap) * 100 + 0.5)
-            local fixed = 6 + 9 + 5 + 1 + 1 + 11 + 1 + 9
-            local bw = math.max(4, math.min(14, w - fixed))
-            segs[#segs + 1] = { colors.yellow, string.format("%3d%% ", pct) }
-            segs[#segs + 1] = { colors.cyan,   "[" .. bar(amount, grandCap, bw) .. "] " }
-            segs[#segs + 1] = { colors.white,  string.format("%9s ", human(amount) .. "/" .. human(grandCap)) }
-        else
-            segs[#segs + 1] = { colors.white,  string.format("%9s ", human(amount)) }
-        end
-
-        local rcolor = colors.gray
-        if rateTotal and rateTotal >  0.5 then rcolor = colors.lime end
-        if rateTotal and rateTotal < -0.5 then rcolor = colors.red  end
-        segs[#segs + 1] = { rcolor, humanRate(rateTotal) .. " " }
-
-        local eta = humanETA(amount, rateTotal)
-        local ecolor = colors.gray
-        if rateTotal and rateTotal < -0.5 and amount > 0 then
-            local s = amount / -rateTotal
-            if     s < 300  then ecolor = colors.red
-            elseif s < 1800 then ecolor = colors.orange
-            else                 ecolor = colors.yellow end
-        end
-        segs[#segs + 1] = { ecolor, eta }
-
-        buf:add(segs)
+    for _, row in ipairs(totalRows(w, sums, grandTotal, grandCap, rateTotal)) do
+        buf:add(row)
     end
+
+    -- footer hint
+    buf:add({ { colors.gray, string.rep("-", w) } })
+    buf:add({ { colors.lightGray, " q: quit  |  refresh " .. REFRESH .. "s" } })
 
     return buf
 end
@@ -345,6 +434,10 @@ local function loop()
             if ev == "timer" and p1 == timer then break end
             if ev == "peripheral" or ev == "peripheral_detach" then break end
             if ev == "key" and p1 == keys.q then
+                if isColor() then
+                    term.setBackgroundColor(colors.black)
+                    term.setTextColor(colors.white)
+                end
                 term.clear()
                 term.setCursorPos(1, 1)
                 return
