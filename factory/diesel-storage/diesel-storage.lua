@@ -18,7 +18,7 @@ local CAPACITY_BY_NAME  = {
 
 local prev = {}        -- [tankName] = { amount=N, t=seconds }
 local rate = {}        -- [tankName] = mB/s (smoothed)
-local prevTotal, rateTotal = nil, 0
+local prevTotal, rateTotal = nil, nil
 
 -- ===== data =====
 
@@ -70,16 +70,37 @@ local function human(n)
     return string.format("%.2fG", n/1000000000)
 end
 
--- "+12 mB/s", "-1.2k mB/s", "  0    mB/s"
+-- "+12 mB/s", "-1.2k mB/s", "  0    mB/s"  (6 chars)
 local function humanRate(r)
-    if not r then return "  --     " end
+    if not r then return "  --  " end
     local abs  = math.abs(r)
     local sign = r > 0.5 and "+" or (r < -0.5 and "-" or " ")
     local body
     if abs < 1000        then body = string.format("%4d", math.floor(abs + 0.5))
-    elseif abs < 1000000 then body = string.format("%5.1fk", abs/1000)
-    else                      body = string.format("%5.2fM", abs/1000000) end
-    return sign .. body
+    elseif abs < 1000000 then body = string.format("%4.1fk", abs/1000)
+    else                      body = string.format("%4.2fM", abs/1000000) end
+    return string.format("%-6s", sign .. body)
+end
+
+-- ETA до опустошения: округление до минут/часов/дней
+-- amount mB, rate mB/s (отрицательный = расход)
+local function humanETA(amount, rate)
+    if not rate or rate >= -0.5 then return "  -- " end
+    if amount <= 0 then return "  0m " end
+    local s = amount / -rate
+    if s < 60     then return " <1m " end
+    if s < 3600   then return string.format("%4dm", math.floor(s/60 + 0.5)) end
+    if s < 86400  then
+        local h = math.floor(s/3600)
+        local m = math.floor((s % 3600)/60 + 0.5)
+        if m == 0 then return string.format("%4dh", h) end
+        if h < 10 then return string.format("%dh%02dm", h, m) end
+        return string.format("%4dh", h)
+    end
+    local d = math.floor(s/86400)
+    local h = math.floor((s % 86400)/3600 + 0.5)
+    if h == 0 or d >= 10 then return string.format("%4dd", d) end
+    return string.format("%dd%02dh", d, h)
 end
 
 local function bar(used, cap, width)
@@ -148,12 +169,12 @@ local function updateTotalRate(total)
         local dt = t - prevTotal.t
         if dt > 0.05 then
             local instant = (total - prevTotal.amount) / dt
-            rateTotal = (rateTotal == 0 and not prevTotal.warm)
-                and instant
-                or (EMA_ALPHA * instant + (1 - EMA_ALPHA) * rateTotal)
+            rateTotal = rateTotal
+                and (EMA_ALPHA * instant + (1 - EMA_ALPHA) * rateTotal)
+                or instant
         end
     end
-    prevTotal = { amount = total, t = t, warm = true }
+    prevTotal = { amount = total, t = t }
 end
 
 -- ===== layout =====
@@ -206,7 +227,18 @@ local function tankLine(idx, name, info, w)
     local rcolor = colors.gray
     if r and r >  0.5 then rcolor = colors.lime end
     if r and r < -0.5 then rcolor = colors.red  end
-    segs[#segs + 1] = { rcolor, humanRate(r) }
+    segs[#segs + 1] = { rcolor, humanRate(r) .. " " }
+
+    -- ETA: красный если опустошение скоро (< 5 мин), оранжевый < 30 мин, жёлтый иначе
+    local eta = humanETA(info.total, r)
+    local ecolor = colors.gray
+    if r and r < -0.5 and info.total > 0 then
+        local s = info.total / -r
+        if     s < 300  then ecolor = colors.red
+        elseif s < 1800 then ecolor = colors.orange
+        else                 ecolor = colors.yellow end
+    end
+    segs[#segs + 1] = { ecolor, eta }
 
     return segs
 end
@@ -272,9 +304,19 @@ local function build(tanks)
         end
 
         local rcolor = colors.gray
-        if rateTotal >  0.5 then rcolor = colors.lime end
-        if rateTotal < -0.5 then rcolor = colors.red  end
-        segs[#segs + 1] = { rcolor, humanRate(rateTotal) }
+        if rateTotal and rateTotal >  0.5 then rcolor = colors.lime end
+        if rateTotal and rateTotal < -0.5 then rcolor = colors.red  end
+        segs[#segs + 1] = { rcolor, humanRate(rateTotal) .. " " }
+
+        local eta = humanETA(amount, rateTotal)
+        local ecolor = colors.gray
+        if rateTotal and rateTotal < -0.5 and amount > 0 then
+            local s = amount / -rateTotal
+            if     s < 300  then ecolor = colors.red
+            elseif s < 1800 then ecolor = colors.orange
+            else                 ecolor = colors.yellow end
+        end
+        segs[#segs + 1] = { ecolor, eta }
 
         buf:add(segs)
     end
